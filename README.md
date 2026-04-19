@@ -6,7 +6,7 @@
 
 ##### Ссылка на приложение
 
-[Открыть приложение](https://ваша-ссылка.streamlit.app)
+[Открыть приложение](https://8xg3uskwpxpuygj2jbtdpc.streamlit.app/)
 
 ##### Как работает:
 
