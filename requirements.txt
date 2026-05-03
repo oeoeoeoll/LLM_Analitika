@@ -2,9 +2,8 @@ streamlit
 pandas
 openpyxl
 matplotlib
-langchain
-langchain-groq
-langchain-experimental
-langgraph
-groq
+smolagents
 litellm
+groq
+seaborn
+numpy
