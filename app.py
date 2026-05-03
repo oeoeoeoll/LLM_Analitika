@@ -1,211 +1,229 @@
 import streamlit as st
 import pandas as pd
-import json
-import requests
+import re
+import io
+import time
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# ── Настройки ────────────────────────────────────────────────
-API_KEY = "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"
-MODEL = "llama-3.1-8b-instant"
-API_URL = "https://api.groq.com/openai/v1/chat/completions"
+from smolagents import CodeAgent, LiteLLMModel, tool
 
-# ── Инструменты для LLM (tool use) ───────────────────────────
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_basic_stats",
-            "description": "Возвращает базовую статистику датасета: количество строк, столбцов, типы данных, пропуски",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "confirmed": {"type": "boolean", "description": "Подтверди что хочешь получить статистику"}
-                },
-                "required": ["confirmed"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_numeric_summary",
-            "description": "Возвращает среднее, минимум, максимум для числовых столбцов",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "confirmed": {"type": "boolean", "description": "Подтверди что хочешь получить числовую статистику"}
-                },
-                "required": ["confirmed"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_top_categories",
-            "description": "Возвращает топ значений для категориальных столбцов",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "confirmed": {"type": "boolean", "description": "Подтверди что хочешь получить топ категорий"}
-                },
-                "required": ["confirmed"]
-            }
-        }
-    }
+# ──────────────────────────────────────────────────────────────────────────
+# ЗАЩИТА ОТ PROMPT INJECTION
+# ──────────────────────────────────────────────────────────────────────────
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+|previous\s+|above\s+)?instructions",
+    r"forget\s+(all\s+|previous\s+|above\s+)?instructions",
+    r"you\s+are\s+now", r"\bact\s+as\b",
+    r"pretend\s+(you\s+are|to\s+be)", r"\bjailbreak\b",
+    r"do\s+anything\s+now", r"(system|admin)\s+(prompt|message|instruction)",
+    r"\bdisregard\b", r"\boverride\b",
 ]
 
-# ── Функции-инструменты ───────────────────────────────────────
-def get_basic_stats(df):
-    result = {
-        "rows": int(len(df)),
-        "columns": int(len(df.columns)),
-        "column_names": list(df.columns),
-        "missing_values": {col: int(df[col].isnull().sum()) for col in df.columns if df[col].isnull().sum() > 0},
-        "duplicates": int(df.duplicated().sum())
-    }
-    return json.dumps(result, ensure_ascii=False)
+def check_injection(text: str) -> bool:
+    if not text:
+        return False
+    return any(re.search(p, text.lower()) for p in INJECTION_PATTERNS)
 
-def get_numeric_summary(df):
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-    if not numeric_cols:
-        return json.dumps({"message": "Числовые столбцы не найдены"})
-    result = {}
-    for col in numeric_cols:
-        result[col] = {
-            "mean": round(float(df[col].mean()), 2),
-            "min": round(float(df[col].min()), 2),
-            "max": round(float(df[col].max()), 2),
-            "std": round(float(df[col].std()), 2)
-        }
-    return json.dumps(result, ensure_ascii=False)
 
-def get_top_categories(df):
-    cat_cols = df.select_dtypes(include="object").columns.tolist()
-    if not cat_cols:
-        return json.dumps({"message": "Категориальные столбцы не найдены"})
-    result = {}
-    for col in cat_cols[:5]:
-        top = df[col].value_counts().head(3).to_dict()
-        result[col] = {str(k): int(v) for k, v in top.items()}
-    return json.dumps(result, ensure_ascii=False)
+# ──────────────────────────────────────────────────────────────────────────
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+# ──────────────────────────────────────────────────────────────────────────
+_current_df: pd.DataFrame = None
+_figures_buffer: list = []
 
-def call_tool(tool_name, df):
-    if tool_name == "get_basic_stats":
-        return get_basic_stats(df)
-    elif tool_name == "get_numeric_summary":
-        return get_numeric_summary(df)
-    elif tool_name == "get_top_categories":
-        return get_top_categories(df)
-    return json.dumps({"error": "Инструмент не найден"})
 
-# ── Основная функция анализа через LLM ───────────────────────
-def analyze_with_llm(df):
-    preview = df.head(5).to_string()
-    columns_info = ", ".join([f"{col} ({str(dtype)})" for col, dtype in df.dtypes.items()])
+# ──────────────────────────────────────────────────────────────────────────
+# TOOL: ИНТЕРПРЕТАТОР КОДА
+# ──────────────────────────────────────────────────────────────────────────
+@tool
+def execute_python_code(code: str) -> str:
+    """
+    Executes Python code for data analysis on the loaded dataset.
+    The dataset is available as variable `df` (pandas DataFrame).
+    Also available: `pd` (pandas), `plt` (matplotlib.pyplot).
+    Use print() for output. Use plt.show() to save charts.
+    Returns stdout output as string.
 
-    system_prompt = """Ты — аналитик данных. Тебе дан датасет. 
-Используй доступные инструменты чтобы изучить данные, затем напиши аналитический отчёт на русском языке.
-Отчёт должен содержать:
-1. Краткое описание датасета
-2. Ключевые метрики и статистику
-3. Интересные наблюдения и тренды
-4. Практические выводы и рекомендации"""
+    Args:
+        code: Python code to execute
+    """
+    global _current_df, _figures_buffer
 
-    user_message = f"""Проанализируй этот датасет.
-Столбцы: {columns_info}
-Первые строки:
-{preview}
+    if _current_df is None:
+        return "Error: no dataset loaded"
 
-Используй инструменты для получения статистики, затем напиши подробный аналитический отчёт."""
+    forbidden = ["read_csv", "read_excel", "requests.get", "urllib", "open(", "subprocess"]
+    for f in forbidden:
+        if f in code:
+            return f"Error: '{f}' is forbidden. Use existing df variable."
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message}
-    ]
+    local_figures = []
+    original_show = plt.show
 
-    # Цикл tool use
-    for _ in range(5):
-        response = requests.post(
-            API_URL,
-            headers={"Authorization": "Bearer " + API_KEY, "Content-Type": "application/json"},
-            json={"model": MODEL, "messages": messages, "tools": TOOLS, "max_tokens": 2000},
-            timeout=60
-        )
-        response.raise_for_status()
-        data = response.json()
-        choice = data["choices"][0]
-        message = choice["message"]
-        messages.append(message)
+    def capture_show(*args, **kwargs):
+        fig = plt.gcf()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+        buf.seek(0)
+        local_figures.append(buf)
+        plt.close(fig)
 
-        # Если модель вызывает инструменты
-        if choice["finish_reason"] == "tool_calls" and message.get("tool_calls"):
-            for tool_call in message["tool_calls"]:
-                tool_name = tool_call["function"]["name"]
-                tool_result = call_tool(tool_name, df)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": tool_result
-                })
-        else:
-            # Модель закончила — возвращаем текст
-            return message.get("content", "Не удалось получить анализ")
+    plt.show = capture_show
 
-    return "Анализ завершён"
+    import sys
+    from io import StringIO
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()
 
-# ── Интерфейс Streamlit ───────────────────────────────────────
-st.set_page_config(page_title="AI Аналитик данных", page_icon="📊", layout="wide")
+    try:
+        exec(code, {
+            "df": _current_df.copy(),
+            "pd": pd,
+            "plt": plt,
+        })
+        output = sys.stdout.getvalue()
+        if not output:
+            output = "Code executed successfully (no output)"
+    except Exception as e:
+        output = f"Error: {str(e)}"
+    finally:
+        sys.stdout = old_stdout
+        plt.show = original_show
 
-st.title("📊 AI Аналитик данных")
-st.markdown("Загрузите CSV-файл и получите автоматический анализ от искусственного интеллекта")
+    _figures_buffer.extend(local_figures)
 
-uploaded_file = st.file_uploader("Выберите CSV-файл", type=["csv"])
+    if len(output) > 3000:
+        output = output[:3000] + "\n...(output truncated)"
+
+    time.sleep(1)
+
+    return output
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# ЗАПУСК АГЕНТА
+# ──────────────────────────────────────────────────────────────────────────
+def run_agent(df: pd.DataFrame, user_instruction: str = "") -> str:
+    global _current_df, _figures_buffer
+    _current_df = df
+    _figures_buffer = []
+
+    import os
+    os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+
+    model = LiteLLMModel(
+        model_id="groq/meta-llama/llama-4-scout-17b-16e-instruct",
+        request_timeout=60,
+    )
+
+    agent = CodeAgent(
+        tools=[execute_python_code],
+        model=model,
+        max_steps=7,
+        additional_authorized_imports=["pandas", "matplotlib", "matplotlib.pyplot", "numpy", "seaborn"],
+    )
+
+    columns_info = ", ".join(df.columns.tolist())
+    dtypes_info = df.dtypes.to_string()
+
+    task = f"""You are a professional data analyst. You have a tool called `execute_python_code`.
+
+IMPORTANT: You do NOT have direct access to `df`.
+You MUST use the `execute_python_code` tool for ALL data access and analysis.
+Inside the tool, `df` is a real pandas DataFrame with {len(df)} rows and {len(df.columns)} columns.
+
+Dataset schema:
+- Columns: {columns_info}
+- Data types:
+{dtypes_info}
+
+HOW TO USE THE TOOL:
+result = execute_python_code(code=\"\"\"
+print(df.describe())
+\"\"\")
+
+NEVER define df yourself. NEVER invent data. ALWAYS use execute_python_code tool.
+Build charts with plt.show() inside the tool code.
+Write the final report in Russian covering: key metrics, distributions, correlations, anomalies, insights.
+
+{"User instruction: " + user_instruction if user_instruction else "Conduct a full exploratory data analysis (EDA)."}
+"""
+
+    result = agent.run(task)
+
+    st.session_state.figures = _figures_buffer.copy()
+
+    if not result or str(result).strip() in ["Отчет готов", "None", ""]:
+        return "⚠️ Агент завершил анализ. Графики отображены выше."
+
+    return str(result)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# STREAMLIT ИНТЕРФЕЙС
+# ──────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="AI Агент-аналитик", layout="wide")
+st.title("📊 AI Агент-аналитик данных")
+
+st.markdown("""
+**✅ Реализация:**
+- Веб-интерфейс на Streamlit
+- LLM через Groq API программно (не через браузер)
+- Агентный фреймворк: **smolagents** (HuggingFace)
+- LLM сама вызывает интерпретатор кода через `@tool`
+- Данные не подставляются в промпт — только схема
+- Защита от prompt injection
+""")
+
+uploaded_file = st.file_uploader(
+    "📂 Загрузите CSV или Excel файл",
+    type=["csv", "xlsx", "xls"]
+)
+
+user_context = st.text_area(
+    "📝 Инструкция для агента (необязательно)",
+    placeholder="Пример: найди аномалии, построй корреляционную матрицу",
+    height=80
+)
+
+if user_context and check_injection(user_context):
+    st.error("⚠️ Обнаружена попытка изменить поведение системы.")
+    st.stop()
 
 if uploaded_file is not None:
-    try:
-        df = pd.read_csv(uploaded_file, encoding="utf-8")
-    except Exception:
-        df = pd.read_csv(uploaded_file, encoding="latin1")
+    if uploaded_file.name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
 
-    st.success(f"Файл загружен: {len(df)} строк, {len(df.columns)} столбцов")
+    st.success(f"✅ Загружено: {len(df)} строк, {len(df.columns)} столбцов")
 
-    # Показываем превью
-    st.subheader("📋 Превью данных")
-    st.dataframe(df.head(10), use_container_width=True)
+    with st.expander("📋 Превью данных"):
+        st.dataframe(df.head(10), use_container_width=True)
 
-    # Быстрая статистика
     col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Строк", len(df))
-    with col2:
-        st.metric("Столбцов", len(df.columns))
-    with col3:
-        st.metric("Пропусков", int(df.isnull().sum().sum()))
+    col1.metric("Строк", len(df))
+    col2.metric("Столбцов", len(df.columns))
+    col3.metric("Пропусков", int(df.isnull().sum().sum()))
 
-    st.divider()
-
-    # Кнопка анализа
-    if st.button("🤖 Запустить AI-анализ", type="primary", use_container_width=True):
-        with st.spinner("AI анализирует данные... Это займёт 10-20 секунд"):
+    if st.button("Запустить анализ", type="primary", use_container_width=True):
+        with st.spinner("Агент анализирует данные..."):
             try:
-                result = analyze_with_llm(df)
-                st.subheader("📝 Результаты AI-анализа")
-                st.markdown(result)
+                report = run_agent(df, user_context)
 
-                # Числовая статистика
-                numeric_cols = df.select_dtypes(include="number").columns
-                if len(numeric_cols) > 0:
-                    st.subheader("📈 Числовая статистика")
-                    st.dataframe(df[numeric_cols].describe().round(2), use_container_width=True)
+                st.subheader("📝 Отчёт агента")
+                st.markdown(report)
+
+                if st.session_state.get("figures"):
+                    st.subheader("📈 Графики")
+                    cols = st.columns(min(len(st.session_state.figures), 2))
+                    for i, buf in enumerate(st.session_state.figures):
+                        buf.seek(0)
+                        cols[i % 2].image(buf, use_container_width=True)
 
             except Exception as e:
-                st.error("Ошибка при анализе: " + str(e))
+                st.error(f"Ошибка: {e}")
 else:
-    st.info("👆 Загрузите CSV-файл чтобы начать анализ")
-    st.markdown("""
-    **Что умеет это приложение:**
-    - 📂 Читает любой CSV-файл
-    - 🔍 Анализирует структуру данных с помощью инструментов
-    - 📊 Считает ключевые метрики
-    - 💡 Формулирует выводы и рекомендации на русском языке
-    """)
+    st.info("👆 Загрузите файл для начала анализа")
